@@ -23,7 +23,7 @@ jobs:
       - run: cargo build --release
       - name: package
         run: |
-          name=camwall-${GITHUB_REF_NAME}-${{ matrix.arch }}-linux
+          name=camwall-${{ matrix.arch }}-linux
           mkdir $name
           cp target/release/camwall README.md LICENSE $name/
           cp -r dist $name/

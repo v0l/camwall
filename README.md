@@ -104,6 +104,20 @@ The build host's aarch64 glibc must be no newer than the one on the Pi. A static
 work because EGL and Wayland are loaded at runtime. Prebuilt x86_64 and aarch64 binaries are attached
 to each GitHub release.
 
+## Setting up a Raspberry Pi from scratch
+
+`dist/cloud-init` has a `user-data` and `network-config` for Raspberry Pi OS Lite (trixie or later, 64 bit),
+which provisions itself with cloud-init on first boot. Flash the image, then copy both files over the
+ones on the card's boot partition after editing them:
+
+- in `user-data`, the SSH key, timezone and the Frigate settings in `/etc/camwall.env`
+- in `network-config`, the WiFi name, password and country, or remove the `wifis` section for ethernet
+
+Set `optional: false` on the interface the Pi will actually use, so cloud-init waits for the network
+before installing packages. First boot needs internet access: it installs cage, then downloads the
+latest aarch64 release of camwall from GitHub. After a few minutes the wall starts on the attached
+screen.
+
 ## Running on a Raspberry Pi
 
 camwall is a Wayland app. On a Pi without a desktop, run it under
