@@ -11,6 +11,7 @@ use eframe::egui::{
 };
 
 use crate::config::{Config, Layout};
+use crate::stats::{self, FrigateStats, HostStats};
 use crate::workers::{self, Link, SharedRef};
 
 const STALE_AFTER: Duration = Duration::from_secs(10);
@@ -65,6 +66,9 @@ pub struct App {
     screensaver: Option<Screensaver>,
     woke_at: Instant,
     ignore_clicks_until: Instant,
+    diagnostics: bool,
+    host: Option<HostStats>,
+    frigate_stats: Option<FrigateStats>,
 }
 
 fn run_command(command: &Option<String>) {
@@ -99,6 +103,7 @@ impl App {
             asleep: false,
         });
         let layout = cfg.layout;
+        let diagnostics = cfg.diagnostics;
         let clock_format = cfg.clock_format.clone();
         let date_format = cfg.date_format.clone();
         let (s, ctx, cfg) = (shared.clone(), cc.egui_ctx.clone(), Arc::new(cfg));
@@ -117,6 +122,9 @@ impl App {
             screensaver,
             woke_at: now,
             ignore_clicks_until: now,
+            diagnostics,
+            host: None,
+            frigate_stats: None,
         }
     }
 
@@ -184,6 +192,8 @@ impl App {
                 });
             }
         }
+        self.host = s.host.clone();
+        self.frigate_stats = s.frigate_stats.clone();
         (status, s.link, s.startup_error.clone(), ready)
     }
 
@@ -233,10 +243,30 @@ impl App {
             Color32::from_gray(150),
         );
         let caption_size = label_size * 0.8;
+        let diag_size = label_size * 0.6;
+        let mut lines: Vec<(String, Color32)> = Vec::new();
+        if self.diagnostics {
+            if let Some(h) = &self.host {
+                let color = if h.undervoltage {
+                    WARNING
+                } else {
+                    Color32::from_gray(130)
+                };
+                lines.push((stats::host_line(h), color));
+            }
+            if let Some(f) = &self.frigate_stats {
+                lines.push((stats::frigate_line(f), Color32::from_gray(130)));
+            }
+        }
+        let diag_top = info.max.y - lines.len() as f32 * diag_size * 1.3 - 4.0;
+        for (i, (text, color)) in lines.into_iter().enumerate() {
+            let pos = pos2(info.center().x, diag_top + i as f32 * diag_size * 1.3);
+            fitted_text(painter, pos, text, diag_size, info.width() - 16.0, color);
+        }
         let y = top + clock_size * 1.1 + label_size * 1.6;
         let slot = Rect::from_min_max(
             pos2(info.min.x + 8.0, y),
-            pos2(info.max.x - 8.0, info.max.y - caption_size * 1.6),
+            pos2(info.max.x - 8.0, diag_top - caption_size * 1.6),
         );
         let aspect = self.event.as_ref().map_or(16.0 / 9.0, |e| e.aspect);
         let area = fit(slot, aspect);
@@ -247,24 +277,26 @@ impl App {
         if let Some(event) = &self.event {
             paint_texture(painter, &event.texture, area);
             let text = format!("{}  {}", event.caption, self.format_event_time(event.start));
-            let width = painter
-                .layout_no_wrap(
-                    text.clone(),
-                    FontId::proportional(caption_size),
-                    Color32::WHITE,
-                )
-                .size()
-                .x;
-            let size = caption_size * (info.width() - 16.0).min(width) / width.max(1.0);
-            painter.text(
-                pos2(info.center().x, area.max.y + caption_size * 0.3),
-                Align2::CENTER_TOP,
-                text,
-                FontId::proportional(size),
-                Color32::from_gray(200),
-            );
+            let pos = pos2(info.center().x, area.max.y + caption_size * 0.3);
+            let color = Color32::from_gray(200);
+            fitted_text(painter, pos, text, caption_size, info.width() - 16.0, color);
         }
     }
+}
+
+fn fitted_text(painter: &Painter, pos: Pos2, text: String, size: f32, width: f32, color: Color32) {
+    let natural = painter
+        .layout_no_wrap(text.clone(), FontId::proportional(size), color)
+        .size()
+        .x;
+    let size = size * width.min(natural) / natural.max(1.0);
+    painter.text(
+        pos,
+        Align2::CENTER_TOP,
+        text,
+        FontId::proportional(size),
+        color,
+    );
 }
 
 fn upload(ctx: &egui::Context, slot: &mut Option<TextureHandle>, name: &str, img: ColorImage) {

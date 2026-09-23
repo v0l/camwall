@@ -11,6 +11,7 @@ use tungstenite::Message;
 
 use crate::config::Config;
 use crate::frigate::{self, Frigate};
+use crate::stats::{self, FrigateStats, HostStats};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Link {
@@ -48,6 +49,8 @@ pub struct Shared {
     pub last_event: Option<LastEvent>,
     pub awake: Arc<AtomicBool>,
     pub event_height: Arc<AtomicU32>,
+    pub host: Option<HostStats>,
+    pub frigate_stats: Option<FrigateStats>,
 }
 
 pub type SharedRef = Arc<Mutex<Shared>>;
@@ -62,6 +65,8 @@ impl Default for Shared {
             last_event: None,
             awake: Arc::new(AtomicBool::new(true)),
             event_height: Arc::new(AtomicU32::new(240)),
+            host: None,
+            frigate_stats: None,
         }
     }
 }
@@ -130,6 +135,14 @@ pub fn start(cfg: Arc<Config>, shared: SharedRef, ctx: egui::Context) {
     {
         let (f, s, x) = (frigate.clone(), shared.clone(), ctx.clone());
         thread::spawn(move || fetch_events(f, rx, s, x));
+    }
+    if cfg.diagnostics {
+        let (s, x) = (shared.clone(), ctx.clone());
+        thread::spawn(move || stats::sample_host(s, x));
+        match frigate.stats() {
+            Ok(v) => shared.lock().unwrap().frigate_stats = Some(stats::parse_frigate(&v)),
+            Err(e) => eprintln!("frigate stats: {e}"),
+        }
     }
     match frigate.latest_event(&cameras) {
         Ok(Some(event)) => {
@@ -353,6 +366,11 @@ fn run_live(
             match topic {
                 "camera_activity" => handle_activity(&shared, cameras, payload),
                 "reviews" => handle_review(&shared, payload),
+                "stats" => {
+                    if let Some(v) = parse_payload(payload) {
+                        shared.lock().unwrap().frigate_stats = Some(stats::parse_frigate(&v));
+                    }
+                }
                 "events" => {
                     tracker.handle(cameras, payload, &tx);
                     continue;

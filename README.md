@@ -18,6 +18,9 @@ Frigate URL and a login. No MQTT broker is involved.
 - Tap a camera to show it full screen, tap again to go back.
 - An optional screensaver blanks the screen, and can turn the display off, until something is
   detected.
+- The display's own CPU, temperature, load and memory, and Frigate's CPU, GPU, detector speed and
+  recording disk use, sit at the bottom of the clock panel. The display line turns red if a Raspberry
+  Pi reports undervoltage.
 - A tile turns red and says why when its feed goes stale, and a banner shows when Frigate cannot be
   reached.
 
@@ -49,6 +52,7 @@ All settings are environment variables.
 | `SCREENSAVER` | off | Seconds without activity before the screen blanks |
 | `SCREEN_OFF_COMMAND` | none | Shell command run when the screensaver starts |
 | `SCREEN_ON_COMMAND` | none | Shell command run when it ends |
+| `DIAGNOSTICS` | `1` | `0` hides the display and Frigate stats |
 | `CLOCK_FORMAT` | `%H:%M` | [chrono format](https://docs.rs/chrono/latest/chrono/format/strftime/index.html) |
 | `DATE_FORMAT` | `%a %d %b` | |
 

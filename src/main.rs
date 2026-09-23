@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod frigate;
+mod stats;
 mod workers;
 
 use eframe::egui;

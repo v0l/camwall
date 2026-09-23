@@ -17,6 +17,7 @@ pub struct Config {
     pub screensaver: Option<Duration>,
     pub screen_off_command: Option<String>,
     pub screen_on_command: Option<String>,
+    pub diagnostics: bool,
     pub clock_format: String,
     pub date_format: String,
 }
@@ -74,6 +75,10 @@ impl Config {
                 .map(Duration::from_secs_f32),
             screen_off_command: var("SCREEN_OFF_COMMAND"),
             screen_on_command: var("SCREEN_ON_COMMAND"),
+            diagnostics: !matches!(
+                var("DIAGNOSTICS").as_deref(),
+                Some("0" | "false" | "no" | "off")
+            ),
             clock_format: var("CLOCK_FORMAT").unwrap_or_else(|| "%H:%M".into()),
             date_format: var("DATE_FORMAT").unwrap_or_else(|| "%a %d %b".into()),
         })

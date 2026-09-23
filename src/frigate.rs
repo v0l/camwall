@@ -211,6 +211,10 @@ impl Frigate {
         )
     }
 
+    pub fn stats(&self) -> Result<Value, String> {
+        self.get_json("/api/stats", &[])
+    }
+
     pub fn config(&self) -> Result<Value, String> {
         self.get_json("/api/config", &[])
     }
