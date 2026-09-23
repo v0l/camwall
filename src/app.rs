@@ -37,7 +37,8 @@ struct TileStatus {
     active: bool,
 }
 
-struct EventPanel {
+struct EventView {
+    id: String,
     caption: String,
     start: f64,
     texture: TextureHandle,
@@ -51,7 +52,8 @@ pub struct App {
     clock_format: String,
     date_format: String,
     tiles: Vec<Tile>,
-    event: Option<EventPanel>,
+    events: Vec<EventView>,
+    events_version: u64,
     manual_focus: Option<usize>,
     auto_dismissed: bool,
     power: Power,
@@ -87,7 +89,8 @@ impl App {
             clock_format,
             date_format,
             tiles: Vec::new(),
-            event: None,
+            events: Vec::new(),
+            events_version: 0,
             manual_focus: None,
             auto_dismissed: false,
             power,
@@ -150,17 +153,29 @@ impl App {
                 active: cam.active_objects > 0,
             });
         }
-        if let Some(event) = s.last_event.as_mut() {
-            if let Some(img) = event.image.take() {
-                let aspect = img.size[0] as f32 / img.size[1] as f32;
-                let mut texture = self.event.take().map(|p| p.texture);
-                upload(ctx, &mut texture, "event", img);
-                self.event = Some(EventPanel {
-                    caption: format!("{}  {}", event.label, event.camera),
-                    start: event.start,
-                    texture: texture.unwrap(),
-                    aspect,
-                });
+        if s.events_version != self.events_version {
+            self.events_version = s.events_version;
+            let mut old = std::mem::take(&mut self.events);
+            for entry in s.events.iter_mut() {
+                let previous = old
+                    .iter()
+                    .position(|v| v.id == entry.id)
+                    .map(|i| old.swap_remove(i));
+                let mut texture = previous.as_ref().map(|v| v.texture.clone());
+                let mut aspect = previous.as_ref().map_or(1.0, |v| v.aspect);
+                if let Some(img) = entry.image.take() {
+                    aspect = img.size[0] as f32 / img.size[1] as f32;
+                    upload(ctx, &mut texture, &entry.id, img);
+                }
+                if let Some(texture) = texture {
+                    self.events.push(EventView {
+                        id: entry.id.clone(),
+                        caption: format!("{}  {}", entry.label, entry.camera),
+                        start: entry.start,
+                        texture,
+                        aspect,
+                    });
+                }
             }
         }
         self.host = s.host.clone();
@@ -169,23 +184,53 @@ impl App {
     }
 
     fn draw_info(&self, painter: &Painter, info: Rect, label_size: f32, ppp: f32) {
-        let clock_size = info.height() / 4.0;
         let local = Local::now();
-        let top = info.min.y + info.height() * 0.05;
-        painter.text(
-            pos2(info.center().x, top),
-            Align2::CENTER_TOP,
-            local.format(&self.clock_format).to_string(),
-            FontId::proportional(clock_size),
-            Color32::from_gray(225),
-        );
-        painter.text(
-            pos2(info.center().x, top + clock_size * 1.1),
-            Align2::CENTER_TOP,
-            local.format(&self.date_format).to_string(),
-            FontId::proportional(label_size),
-            Color32::from_gray(150),
-        );
+        let clock = local.format(&self.clock_format).to_string();
+        let date = local.format(&self.date_format).to_string();
+        let header_bottom = if self.events.is_empty() {
+            let clock_size = info.height() / 4.0;
+            let top = info.min.y + info.height() * 0.05;
+            painter.text(
+                pos2(info.center().x, top),
+                Align2::CENTER_TOP,
+                clock,
+                FontId::proportional(clock_size),
+                Color32::from_gray(225),
+            );
+            painter.text(
+                pos2(info.center().x, top + clock_size * 1.1),
+                Align2::CENTER_TOP,
+                date,
+                FontId::proportional(label_size),
+                Color32::from_gray(150),
+            );
+            top + clock_size * 1.1 + label_size * 1.6
+        } else {
+            let clock_size = (info.height() / 7.0).max(label_size * 1.4);
+            let clock = painter.layout_no_wrap(
+                clock,
+                FontId::proportional(clock_size),
+                Color32::from_gray(225),
+            );
+            let date = painter.layout_no_wrap(
+                date,
+                FontId::proportional(label_size),
+                Color32::from_gray(150),
+            );
+            let gap = label_size;
+            let width = clock.size().x + gap + date.size().x;
+            let left = info.center().x - width / 2.0;
+            let top = info.min.y + 4.0;
+            let date_top = top + clock.size().y - date.size().y - clock_size * 0.1;
+            let bottom = top + clock.size().y;
+            painter.galley(pos2(left, top), clock.clone(), Color32::from_gray(225));
+            painter.galley(
+                pos2(left + clock.size().x + gap, date_top),
+                date,
+                Color32::from_gray(150),
+            );
+            bottom + 6.0
+        };
         let caption_size = label_size * 0.8;
         let diag_size = label_size * 0.6;
         let mut lines: Vec<(String, Color32)> = Vec::new();
@@ -207,24 +252,47 @@ impl App {
             let pos = pos2(info.center().x, diag_top + i as f32 * diag_size * 1.3);
             fitted_text(painter, pos, text, diag_size, info.width() - 16.0, color);
         }
-        let y = top + clock_size * 1.1 + label_size * 1.6;
         let slot = Rect::from_min_max(
-            pos2(info.min.x + 8.0, y),
-            pos2(info.max.x - 8.0, diag_top - caption_size * 1.6),
+            pos2(info.min.x + 8.0, header_bottom),
+            pos2(info.max.x - 8.0, diag_top - 4.0),
         );
-        let aspect = self.event.as_ref().map_or(16.0 / 9.0, |e| e.aspect);
-        let area = fit(slot, aspect);
-        self.event_height.store(
-            (area.height() * ppp).round().max(64.0) as u32,
-            Ordering::Relaxed,
-        );
-        if let Some(event) = &self.event {
+        self.draw_events(painter, slot, caption_size, ppp);
+    }
+
+    fn draw_events(&self, painter: &Painter, slot: Rect, caption_size: f32, ppp: f32) {
+        if self.events.is_empty() || slot.height() < 24.0 {
+            return;
+        }
+        let aspect = self.events.iter().map(|e| e.aspect).sum::<f32>() / self.events.len() as f32;
+        let image_rect = |cell: Rect, caption: f32| {
+            let inner = cell.shrink(3.0);
+            Rect::from_min_max(inner.min, pos2(inner.max.x, inner.max.y - caption * 1.3))
+        };
+        let caption_for = |cell: Rect| caption_size.min(cell.height() * 0.14);
+        let min_height = (slot.height() * 0.5).max(56.0);
+        let min_width = caption_size * 8.0;
+        let count = (1..=self.events.len())
+            .rev()
+            .find(|&k| {
+                let cell = cells(slot, k, aspect)[0];
+                let image = fit(image_rect(cell, caption_for(cell)), aspect);
+                image.height() >= min_height && cell.width() >= min_width
+            })
+            .unwrap_or(1);
+        let layout = cells(slot, count, aspect);
+        let mut want = 64.0f32;
+        for (event, cell) in self.events.iter().zip(layout) {
+            let caption = caption_for(cell);
+            let area = fit(image_rect(cell, caption), event.aspect);
+            want = want.max(area.height() * ppp);
             paint_texture(painter, &event.texture, area);
             let text = format!("{}  {}", event.caption, self.format_event_time(event.start));
-            let pos = pos2(info.center().x, area.max.y + caption_size * 0.3);
+            let pos = pos2(cell.center().x, area.max.y + caption * 0.2);
             let color = Color32::from_gray(200);
-            fitted_text(painter, pos, text, caption_size, info.width() - 16.0, color);
+            fitted_text(painter, pos, text, caption, cell.width() - 6.0, color);
         }
+        self.event_height
+            .store(want.round() as u32, Ordering::Relaxed);
     }
 }
 
@@ -258,19 +326,18 @@ fn fit(rect: Rect, aspect: f32) -> Rect {
     Rect::from_center_size(rect.center(), vec2(w, w / aspect))
 }
 
-fn grid(screen: Rect, cams: usize, aspect: f32) -> (Vec<Rect>, Rect) {
-    let slots = cams + 1;
+fn columns(area: Rect, slots: usize, aspect: f32) -> usize {
     let shape = |cols: usize| {
         let rows = slots.div_ceil(cols);
-        vec2(screen.width() / cols as f32, screen.height() / rows as f32)
+        vec2(area.width() / cols as f32, area.height() / rows as f32)
     };
     let score = |cols: usize| {
         let cell = shape(cols);
-        let area = fit(Rect::from_min_size(Pos2::ZERO, cell), aspect).area();
+        let fitted = fit(Rect::from_min_size(Pos2::ZERO, cell), aspect).area();
         let mismatch = ((cell.x / cell.y) / aspect).ln().abs();
-        (area, mismatch)
+        (fitted, mismatch)
     };
-    let cols = (1..=slots)
+    (1..=slots.max(1))
         .max_by(|&a, &b| {
             let ((area_a, mis_a), (area_b, mis_b)) = (score(a), score(b));
             if (area_a - area_b).abs() > area_a.max(area_b) * 0.01 {
@@ -279,8 +346,37 @@ fn grid(screen: Rect, cams: usize, aspect: f32) -> (Vec<Rect>, Rect) {
                 mis_b.total_cmp(&mis_a)
             }
         })
-        .unwrap_or(1);
-    let cell = shape(cols);
+        .unwrap_or(1)
+}
+
+fn cell_size(area: Rect, slots: usize, cols: usize) -> egui::Vec2 {
+    let rows = slots.div_ceil(cols).max(1);
+    vec2(area.width() / cols as f32, area.height() / rows as f32)
+}
+
+fn cells(area: Rect, count: usize, aspect: f32) -> Vec<Rect> {
+    let cols = columns(area, count, aspect);
+    let cell = cell_size(area, count, cols);
+    let last_row = (count - 1) / cols;
+    let in_last = count - last_row * cols;
+    (0..count)
+        .map(|i| {
+            let (row, col) = (i / cols, i % cols);
+            let offset = if row == last_row {
+                (cols - in_last) as f32 * cell.x / 2.0
+            } else {
+                0.0
+            };
+            let min = area.min + vec2(offset + col as f32 * cell.x, row as f32 * cell.y);
+            Rect::from_min_size(min, cell)
+        })
+        .collect()
+}
+
+fn grid(screen: Rect, cams: usize, aspect: f32) -> (Vec<Rect>, Rect) {
+    let slots = cams + 1;
+    let cols = columns(screen, slots, aspect);
+    let cell = cell_size(screen, slots, cols);
     let at = |i: usize| screen.min + vec2((i % cols) as f32 * cell.x, (i / cols) as f32 * cell.y);
     let rects = (0..cams)
         .map(|i| Rect::from_min_size(at(i), cell))
@@ -355,18 +451,22 @@ impl eframe::App for App {
         let (level, asleep) = self.power.update(ctx, activity);
         let screen = root.max_rect();
 
-        let alerting = status
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.alert_seen.map(|t| (i, t)))
-            .max_by_key(|(_, t)| *t)
-            .map(|(i, _)| i);
-        if alerting.is_none() {
+        let any_alert = status.iter().any(|s| s.alert_seen.is_some());
+        let auto: Vec<usize> = if any_alert {
+            (0..status.len())
+                .filter(|&i| status[i].alert_seen.is_some() || status[i].active)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if auto.is_empty() {
             self.auto_dismissed = false;
         }
-        let focus = self
-            .manual_focus
-            .or(if self.auto_dismissed { None } else { alerting });
+        let focus: Vec<usize> = match self.manual_focus {
+            Some(i) => vec![i],
+            None if !self.auto_dismissed => auto,
+            None => Vec::new(),
+        };
         let clicks_allowed = self.power.clicks_allowed();
 
         egui::CentralPanel::default()
@@ -408,9 +508,14 @@ impl eframe::App for App {
                     known.iter().sum::<f32>() / known.len() as f32
                 };
                 let (tile_rects, info) = arrange(screen, self.tiles.len(), self.layout, aspect);
-                let rects: Vec<(usize, Rect)> = match focus {
-                    Some(i) => vec![(i, screen)],
-                    None => tile_rects.into_iter().enumerate().collect(),
+                let rects: Vec<(usize, Rect)> = match focus.len() {
+                    0 => tile_rects.into_iter().enumerate().collect(),
+                    1 => vec![(focus[0], screen)],
+                    n => focus
+                        .iter()
+                        .copied()
+                        .zip(cells(screen, n, aspect))
+                        .collect(),
                 };
 
                 for (i, rect) in &rects {
@@ -447,18 +552,17 @@ impl eframe::App for App {
 
                     let response = ui.interact(*rect, ui.id().with(("tile", *i)), Sense::click());
                     if response.clicked() && clicks_allowed {
-                        if focus.is_some() {
-                            if self.manual_focus.is_none() {
-                                self.auto_dismissed = true;
-                            }
+                        if self.manual_focus.is_some() {
                             self.manual_focus = None;
+                        } else if focus.len() == 1 {
+                            self.auto_dismissed = true;
                         } else {
                             self.manual_focus = Some(*i);
                         }
                     }
                 }
 
-                if focus.is_none() {
+                if focus.is_empty() {
                     self.draw_info(&painter, info, label_size, ppp);
                 }
 
@@ -489,6 +593,16 @@ mod tests {
         assert_eq!(columns(4, 1280.0, 720.0, 16.0 / 9.0), 3);
         assert_eq!(columns(8, 1280.0, 720.0, 16.0 / 9.0), 3);
         assert_eq!(columns(3, 720.0, 1280.0, 16.0 / 9.0), 1);
+    }
+
+    #[test]
+    fn split_centres_last_row() {
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 720.0));
+        assert_eq!(cells(screen, 1, 16.0 / 9.0), vec![screen]);
+        let three = cells(screen, 3, 16.0 / 9.0);
+        assert_eq!(three.len(), 3);
+        assert!((three[2].center().x - 640.0).abs() < 1.0);
+        assert!(three.iter().all(|r| screen.contains_rect(*r)));
     }
 
     #[test]

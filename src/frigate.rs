@@ -219,12 +219,12 @@ impl Frigate {
         self.get_json("/api/config", &[])
     }
 
-    pub fn latest_event(&self, cameras: &[String]) -> Result<Option<Value>, String> {
+    pub fn recent_events(&self, cameras: &[String], limit: usize) -> Result<Vec<Value>, String> {
         let events = self.get_json(
             "/api/events",
-            &[("limit", "1".into()), ("cameras", cameras.join(","))],
+            &[("limit", limit.to_string()), ("cameras", cameras.join(","))],
         )?;
-        Ok(events.as_array().and_then(|a| a.first()).cloned())
+        Ok(events.as_array().cloned().unwrap_or_default())
     }
 
     pub fn connect(&self) -> Result<Socket, String> {

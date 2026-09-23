@@ -34,7 +34,10 @@ pub struct CamState {
     pub active_objects: u32,
 }
 
-pub struct LastEvent {
+pub const MAX_EVENTS: usize = 12;
+
+pub struct EventEntry {
+    pub id: String,
     pub camera: String,
     pub label: String,
     pub start: f64,
@@ -46,7 +49,8 @@ pub struct Shared {
     pub cams: HashMap<String, CamState>,
     pub link: Link,
     pub startup_error: Option<String>,
-    pub last_event: Option<LastEvent>,
+    pub events: Vec<EventEntry>,
+    pub events_version: u64,
     pub awake: Arc<AtomicBool>,
     pub event_height: Arc<AtomicU32>,
     pub host: Option<HostStats>,
@@ -62,7 +66,8 @@ impl Default for Shared {
             cams: HashMap::new(),
             link: Link::Connecting,
             startup_error: None,
-            last_event: None,
+            events: Vec::new(),
+            events_version: 0,
             awake: Arc::new(AtomicBool::new(true)),
             event_height: Arc::new(AtomicU32::new(240)),
             host: None,
@@ -144,13 +149,12 @@ pub fn start(cfg: Arc<Config>, shared: SharedRef, ctx: egui::Context) {
             Err(e) => eprintln!("frigate stats: {e}"),
         }
     }
-    match frigate.latest_event(&cameras) {
-        Ok(Some(event)) => {
-            if let Some(e) = event_ref(&event) {
+    match frigate.recent_events(&cameras, MAX_EVENTS) {
+        Ok(events) => {
+            for e in events.iter().rev().filter_map(event_ref) {
                 let _ = tx.send(e);
             }
         }
-        Ok(None) => {}
         Err(e) => eprintln!("frigate events: {e}"),
     }
     run_live(&frigate, &cameras, tx, shared, ctx);
@@ -213,25 +217,41 @@ fn fetch_events(
     shared: SharedRef,
     ctx: egui::Context,
 ) {
-    while let Ok(mut event) = rx.recv() {
-        while let Ok(newer) = rx.try_recv() {
-            event = newer;
-        }
-        let height = shared.lock().unwrap().event_height.load(Ordering::Relaxed);
-        match frigate
-            .event_image(&event.id, event.snapshot, height)
-            .and_then(|b| decode(&b))
-        {
-            Ok(img) => {
-                shared.lock().unwrap().last_event = Some(LastEvent {
-                    camera: event.camera,
-                    label: event.label,
-                    start: event.start,
-                    image: Some(img),
-                });
-                ctx.request_repaint();
-            }
-            Err(e) => eprintln!("event {}: {e}", event.id),
+    while let Ok(first) = rx.recv() {
+        let mut pending = vec![first];
+        pending.extend(rx.try_iter());
+        let mut seen = std::collections::HashSet::new();
+        let batch: Vec<EventRef> = pending
+            .into_iter()
+            .rev()
+            .filter(|e| seen.insert(e.id.clone()))
+            .collect();
+        for event in batch {
+            let height = shared.lock().unwrap().event_height.load(Ordering::Relaxed);
+            let image = match frigate
+                .event_image(&event.id, event.snapshot, height)
+                .and_then(|b| decode(&b))
+            {
+                Ok(img) => img,
+                Err(e) => {
+                    eprintln!("event {}: {e}", event.id);
+                    continue;
+                }
+            };
+            let mut s = shared.lock().unwrap();
+            s.events.retain(|e| e.id != event.id);
+            s.events.push(EventEntry {
+                id: event.id,
+                camera: event.camera,
+                label: event.label,
+                start: event.start,
+                image: Some(image),
+            });
+            s.events.sort_by(|a, b| b.start.total_cmp(&a.start));
+            s.events.truncate(MAX_EVENTS);
+            s.events_version += 1;
+            drop(s);
+            ctx.request_repaint();
         }
     }
 }
@@ -286,9 +306,9 @@ fn handle_review(shared: &SharedRef, payload: &Value) {
     }
 }
 
+#[derive(Default)]
 struct EventTracker {
-    last_id: Option<String>,
-    last_fetch: Instant,
+    fetched: HashMap<String, Instant>,
 }
 
 impl EventTracker {
@@ -306,11 +326,14 @@ impl EventTracker {
         let Some(event) = event_ref(after) else {
             return;
         };
-        let is_new = self.last_id.as_deref() != Some(event.id.as_str());
-        let due = self.last_fetch.elapsed() > Duration::from_secs(3);
-        if is_new || msg["type"] == "end" || due {
-            self.last_id = Some(event.id.clone());
-            self.last_fetch = Instant::now();
+        let due = self
+            .fetched
+            .get(&event.id)
+            .is_none_or(|t| t.elapsed() > Duration::from_secs(3));
+        if due || msg["type"] == "end" {
+            self.fetched
+                .retain(|_, t| t.elapsed() < Duration::from_secs(3600));
+            self.fetched.insert(event.id.clone(), Instant::now());
             let _ = tx.send(event);
         }
     }
@@ -327,10 +350,7 @@ fn run_live(
         shared.lock().unwrap().link = link;
         ctx.request_repaint();
     };
-    let mut tracker = EventTracker {
-        last_id: None,
-        last_fetch: Instant::now(),
-    };
+    let mut tracker = EventTracker::default();
     loop {
         let mut socket = match frigate.connect() {
             Ok(s) => s,

@@ -11,11 +11,14 @@ Frigate URL and a login. No MQTT broker is involved.
 
 - A camera with active tracked objects gets the same red outline as in the Frigate live view.
 - When Frigate raises an alert, that camera takes over the screen and shows when the alert started,
-  until the alert ends.
-- The latest event is shown under the clock with its label, camera and time.
+  until the alert ends. If other cameras are alerting or tracking objects at the same time, the screen
+  splits between all of them.
+- Recent events are shown under the clock with their label, camera and time, as many as fit at a
+  readable size.
 - Tiles are fetched at the size they are drawn, and the grid picks the column count that makes the
   cameras largest, so it works the same on a 7" 800x480 panel and on a 4K monitor.
-- Tap a camera to show it full screen, tap again to go back.
+- Tap a camera to show it full screen, tap again to go back. In a split, a tap picks one camera and a
+  second tap returns to the split.
 - The screen can dim when nothing is happening, turn off after a longer time, and come straight back
   when something is detected.
 - The display's own CPU, temperature, load and memory, and Frigate's CPU, GPU, detector speed and
