@@ -20,6 +20,10 @@ fn main() -> eframe::Result {
             .with_fullscreen(true)
             .with_decorations(false),
         renderer: eframe::Renderer::Glow,
+        glow_options: eframe::egui_glow::GlowConfiguration {
+            vsync: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(

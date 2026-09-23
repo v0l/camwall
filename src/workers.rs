@@ -1,24 +1,27 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local};
 use eframe::egui::{self, ColorImage};
-use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
 use serde_json::Value;
+use tungstenite::Message;
 
-use crate::config::{Config, MqttHost};
-use crate::frigate::{self, Frigate, MqttSettings};
+use crate::config::Config;
+use crate::frigate::{self, Frigate};
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum MqttStatus {
-    Disabled,
+pub enum Link {
     Connecting,
     Online,
-    FrigateOffline,
-    Disconnected,
+    Offline,
+}
+
+pub struct Alert {
+    pub seen: Instant,
+    pub start: f64,
 }
 
 #[derive(Default)]
@@ -26,22 +29,25 @@ pub struct CamState {
     pub frame: Option<ColorImage>,
     pub updated: Option<Instant>,
     pub error: Option<String>,
-    pub alerts: HashMap<String, Instant>,
+    pub alerts: HashMap<String, Alert>,
+    pub active_objects: u32,
 }
 
-pub struct Snapshot {
+pub struct LastEvent {
     pub camera: String,
     pub label: String,
+    pub start: f64,
     pub image: Option<ColorImage>,
-    pub at: Option<DateTime<Local>>,
 }
 
 pub struct Shared {
     pub cameras: Option<Vec<(String, Arc<AtomicU32>)>>,
     pub cams: HashMap<String, CamState>,
-    pub mqtt: MqttStatus,
+    pub link: Link,
     pub startup_error: Option<String>,
-    pub snapshot: Option<Snapshot>,
+    pub last_event: Option<LastEvent>,
+    pub awake: Arc<AtomicBool>,
+    pub event_height: Arc<AtomicU32>,
 }
 
 pub type SharedRef = Arc<Mutex<Shared>>;
@@ -51,11 +57,21 @@ impl Default for Shared {
         Self {
             cameras: None,
             cams: HashMap::new(),
-            mqtt: MqttStatus::Disabled,
+            link: Link::Connecting,
             startup_error: None,
-            snapshot: None,
+            last_event: None,
+            awake: Arc::new(AtomicBool::new(true)),
+            event_height: Arc::new(AtomicU32::new(240)),
         }
     }
+}
+
+struct EventRef {
+    id: String,
+    camera: String,
+    label: String,
+    start: f64,
+    snapshot: bool,
 }
 
 pub fn decode(bytes: &[u8]) -> Result<ColorImage, String> {
@@ -66,12 +82,12 @@ pub fn decode(bytes: &[u8]) -> Result<ColorImage, String> {
     Ok(ColorImage::from_rgb(size, img.as_raw()))
 }
 
-fn fetch_config(frigate: &Frigate, shared: &SharedRef, ctx: &egui::Context) -> Value {
+fn discover_cameras(frigate: &Frigate, shared: &SharedRef, ctx: &egui::Context) -> Vec<String> {
     loop {
         match frigate.config() {
             Ok(v) => {
                 shared.lock().unwrap().startup_error = None;
-                return v;
+                return frigate::dashboard_cameras(&v);
             }
             Err(e) => {
                 eprintln!("frigate config: {e}");
@@ -85,71 +101,62 @@ fn fetch_config(frigate: &Frigate, shared: &SharedRef, ctx: &egui::Context) -> V
 
 pub fn start(cfg: Arc<Config>, shared: SharedRef, ctx: egui::Context) {
     let frigate = Arc::new(Frigate::new(&cfg));
-    let needs_remote = cfg.cameras.is_none() || matches!(cfg.mqtt_host, MqttHost::FromFrigate);
-    let remote = needs_remote.then(|| fetch_config(&frigate, &shared, &ctx));
-
-    let cameras = cfg.cameras.clone().unwrap_or_else(|| {
-        remote.as_ref().map(frigate::dashboard_cameras).unwrap_or_default()
-    });
-    let remote_prefix = remote
-        .as_ref()
-        .and_then(|r| r["mqtt"]["topic_prefix"].as_str())
-        .map(str::to_string);
-    let topic_prefix = cfg
-        .topic_prefix
-        .clone()
-        .or(remote_prefix)
-        .unwrap_or_else(|| "frigate".into());
-    let mqtt = match &cfg.mqtt_host {
-        MqttHost::Off => None,
-        MqttHost::Explicit(host, port) => Some(MqttSettings {
-            host: host.clone(),
-            port: *port,
-            topic_prefix,
-        }),
-        MqttHost::FromFrigate => remote.as_ref().and_then(frigate::mqtt_settings).map(|m| MqttSettings {
-            topic_prefix,
-            ..m
-        }),
+    let cameras = match &cfg.cameras {
+        Some(c) => c.clone(),
+        None => discover_cameras(&frigate, &shared, &ctx),
     };
 
     let handles: Vec<(String, Arc<AtomicU32>)> = cameras
         .iter()
         .map(|c| (c.clone(), Arc::new(AtomicU32::new(360))))
         .collect();
+    let awake = shared.lock().unwrap().awake.clone();
     for (camera, want) in &handles {
-        let (f, c, w, s, x, i) = (
+        let (f, c, w, a, s, x, i) = (
             frigate.clone(),
             camera.clone(),
             want.clone(),
+            awake.clone(),
             shared.clone(),
             ctx.clone(),
             cfg.interval,
         );
-        thread::spawn(move || poll_camera(f, c, w, s, x, i));
+        thread::spawn(move || poll_camera(f, c, w, a, s, x, i));
     }
-    {
-        let mut s = shared.lock().unwrap();
-        s.cameras = Some(handles);
-        if mqtt.is_some() {
-            s.mqtt = MqttStatus::Connecting;
-        }
-    }
+    shared.lock().unwrap().cameras = Some(handles);
     ctx.request_repaint();
-    if let Some(settings) = mqtt {
-        run_mqtt(&cfg, settings, cameras, shared, ctx);
+
+    let (tx, rx) = mpsc::channel();
+    {
+        let (f, s, x) = (frigate.clone(), shared.clone(), ctx.clone());
+        thread::spawn(move || fetch_events(f, rx, s, x));
     }
+    match frigate.latest_event(&cameras) {
+        Ok(Some(event)) => {
+            if let Some(e) = event_ref(&event) {
+                let _ = tx.send(e);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("frigate events: {e}"),
+    }
+    run_live(&frigate, &cameras, tx, shared, ctx);
 }
 
 fn poll_camera(
     frigate: Arc<Frigate>,
     camera: String,
     want_height: Arc<AtomicU32>,
+    awake: Arc<AtomicBool>,
     shared: SharedRef,
     ctx: egui::Context,
     interval: Duration,
 ) {
     loop {
+        if !awake.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
         let start = Instant::now();
         let result = frigate
             .snapshot(&camera, want_height.load(Ordering::Relaxed))
@@ -168,13 +175,80 @@ fn poll_camera(
             }
         }
         ctx.request_repaint();
-        let pause = if failed { Duration::from_secs(5) } else { interval };
+        let pause = if failed {
+            Duration::from_secs(5)
+        } else {
+            interval
+        };
         thread::sleep(pause.saturating_sub(start.elapsed()));
     }
 }
 
-fn handle_review(shared: &SharedRef, payload: &[u8]) {
-    let Ok(msg) = serde_json::from_slice::<Value>(payload) else {
+fn event_ref(event: &Value) -> Option<EventRef> {
+    Some(EventRef {
+        id: event["id"].as_str()?.to_string(),
+        camera: event["camera"].as_str()?.to_string(),
+        label: event["label"].as_str()?.to_string(),
+        start: event["start_time"].as_f64()?,
+        snapshot: event["has_snapshot"].as_bool() == Some(true),
+    })
+}
+
+fn fetch_events(
+    frigate: Arc<Frigate>,
+    rx: Receiver<EventRef>,
+    shared: SharedRef,
+    ctx: egui::Context,
+) {
+    while let Ok(mut event) = rx.recv() {
+        while let Ok(newer) = rx.try_recv() {
+            event = newer;
+        }
+        let height = shared.lock().unwrap().event_height.load(Ordering::Relaxed);
+        match frigate
+            .event_image(&event.id, event.snapshot, height)
+            .and_then(|b| decode(&b))
+        {
+            Ok(img) => {
+                shared.lock().unwrap().last_event = Some(LastEvent {
+                    camera: event.camera,
+                    label: event.label,
+                    start: event.start,
+                    image: Some(img),
+                });
+                ctx.request_repaint();
+            }
+            Err(e) => eprintln!("event {}: {e}", event.id),
+        }
+    }
+}
+
+fn parse_payload(payload: &Value) -> Option<Value> {
+    match payload {
+        Value::String(s) => serde_json::from_str(s).ok(),
+        other => Some(other.clone()),
+    }
+}
+
+fn handle_activity(shared: &SharedRef, cameras: &[String], payload: &Value) {
+    let Some(activity) = parse_payload(payload) else {
+        return;
+    };
+    let mut s = shared.lock().unwrap();
+    for camera in cameras {
+        let Some(objects) = activity[camera]["objects"].as_array() else {
+            continue;
+        };
+        let active = objects
+            .iter()
+            .filter(|o| o["stationary"].as_bool() != Some(true))
+            .count();
+        s.cams.entry(camera.clone()).or_default().active_objects = active as u32;
+    }
+}
+
+fn handle_review(shared: &SharedRef, payload: &Value) {
+    let Some(msg) = parse_payload(payload) else {
         return;
     };
     let after = &msg["after"];
@@ -188,81 +262,121 @@ fn handle_review(shared: &SharedRef, payload: &[u8]) {
     if ended || !alert {
         alerts.remove(id);
     } else {
-        alerts.insert(id.to_string(), Instant::now());
+        let start = after["start_time"].as_f64().unwrap_or(0.0);
+        alerts.insert(
+            id.to_string(),
+            Alert {
+                seen: Instant::now(),
+                start,
+            },
+        );
     }
 }
 
-fn run_mqtt(
-    cfg: &Config,
-    settings: MqttSettings,
-    cameras: Vec<String>,
+struct EventTracker {
+    last_id: Option<String>,
+    last_fetch: Instant,
+}
+
+impl EventTracker {
+    fn handle(&mut self, cameras: &[String], payload: &Value, tx: &Sender<EventRef>) {
+        let Some(msg) = parse_payload(payload) else {
+            return;
+        };
+        let after = &msg["after"];
+        let wanted = after["camera"]
+            .as_str()
+            .is_some_and(|c| cameras.iter().any(|x| x == c));
+        if !wanted || after["false_positive"].as_bool() == Some(true) {
+            return;
+        }
+        let Some(event) = event_ref(after) else {
+            return;
+        };
+        let is_new = self.last_id.as_deref() != Some(event.id.as_str());
+        let due = self.last_fetch.elapsed() > Duration::from_secs(3);
+        if is_new || msg["type"] == "end" || due {
+            self.last_id = Some(event.id.clone());
+            self.last_fetch = Instant::now();
+            let _ = tx.send(event);
+        }
+    }
+}
+
+fn run_live(
+    frigate: &Frigate,
+    cameras: &[String],
+    tx: Sender<EventRef>,
     shared: SharedRef,
     ctx: egui::Context,
 ) {
-    let mut opts = MqttOptions::new(
-        format!("camwall-{}", std::process::id()),
-        settings.host.clone(),
-        settings.port,
-    );
-    opts.set_keep_alive(Duration::from_secs(30));
-    opts.set_max_packet_size(8 << 20, 64 << 10);
-    if let Some(user) = &cfg.mqtt_user {
-        opts.set_credentials(user.clone(), cfg.mqtt_password.clone().unwrap_or_default());
-    }
-    let (client, mut connection) = Client::new(opts, 32);
-    let prefix = settings.topic_prefix;
-    let available = format!("{prefix}/available");
-    let reviews = format!("{prefix}/reviews");
-    let snapshots = format!("{prefix}/+/+/snapshot");
-    let set_status = |status| {
-        shared.lock().unwrap().mqtt = status;
+    let set_link = |link| {
+        shared.lock().unwrap().link = link;
         ctx.request_repaint();
     };
-
-    for event in connection.iter() {
-        match event {
-            Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                for t in [&available, &reviews, &snapshots] {
-                    let _ = client.subscribe(t.as_str(), QoS::AtMostOnce);
-                }
-                set_status(MqttStatus::Online);
+    let mut tracker = EventTracker {
+        last_id: None,
+        last_fetch: Instant::now(),
+    };
+    loop {
+        let mut socket = match frigate.connect() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("frigate websocket: {e}");
+                set_link(Link::Offline);
+                thread::sleep(Duration::from_secs(5));
+                continue;
             }
-            Ok(Event::Incoming(Packet::Publish(p))) => {
-                let topic = p.topic.as_str();
-                if topic == available {
-                    set_status(if p.payload.as_ref() == b"online" {
-                        MqttStatus::Online
-                    } else {
-                        MqttStatus::FrigateOffline
-                    });
-                } else if topic == reviews {
-                    handle_review(&shared, &p.payload);
-                    ctx.request_repaint();
-                } else if let Some(rest) = topic.strip_prefix(&format!("{prefix}/")) {
-                    let parts: Vec<&str> = rest.split('/').collect();
-                    let [camera, label, "snapshot"] = parts[..] else {
+        };
+        let hello = r#"{"topic":"onConnect","message":"","retain":false}"#;
+        if socket.send(Message::text(hello)).is_err() {
+            continue;
+        }
+        set_link(Link::Online);
+        loop {
+            let text = match socket.read() {
+                Ok(Message::Text(t)) => t,
+                Ok(Message::Close(_)) => break,
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("frigate websocket: {e}");
+                    break;
+                }
+            };
+            let Ok(msg) = serde_json::from_str::<Value>(text.as_str()) else {
+                continue;
+            };
+            let Some(topic) = msg["topic"].as_str() else {
+                continue;
+            };
+            let payload = &msg["payload"];
+            match topic {
+                "camera_activity" => handle_activity(&shared, cameras, payload),
+                "reviews" => handle_review(&shared, payload),
+                "events" => {
+                    tracker.handle(cameras, payload, &tx);
+                    continue;
+                }
+                t => {
+                    let Some(camera) = t.strip_suffix("/all/active") else {
                         continue;
                     };
                     if !cameras.iter().any(|c| c == camera) {
                         continue;
                     }
-                    if let Ok(img) = decode(&p.payload) {
-                        shared.lock().unwrap().snapshot = Some(Snapshot {
-                            camera: camera.to_string(),
-                            label: label.to_string(),
-                            image: Some(img),
-                            at: (!p.retain).then(Local::now),
-                        });
-                        ctx.request_repaint();
-                    }
+                    let count = parse_payload(payload).and_then(|v| v.as_u64()).unwrap_or(0);
+                    shared
+                        .lock()
+                        .unwrap()
+                        .cams
+                        .entry(camera.to_string())
+                        .or_default()
+                        .active_objects = count as u32;
                 }
             }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("mqtt: {e}");
-                set_status(MqttStatus::Disconnected);
-                thread::sleep(Duration::from_secs(2));
-            }
+            ctx.request_repaint();
         }
+        set_link(Link::Offline);
+        thread::sleep(Duration::from_secs(2));
     }
 }
