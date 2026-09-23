@@ -1,0 +1,21 @@
+[package]
+name = "camwall"
+version = "0.1.0"
+edition = "2021"
+description = "Full screen camera wall for Frigate NVR"
+license = "MIT"
+readme = "README.md"
+keywords = ["frigate", "nvr", "egui", "raspberry-pi", "kiosk"]
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "wayland"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+rumqttc = { version = "0.25.1", default-features = false }
+serde_json = "1.0.151"
+ureq = "3.4.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
