@@ -14,7 +14,11 @@ pub struct Config {
     pub cameras: Option<Vec<String>>,
     pub interval: Duration,
     pub layout: Layout,
-    pub screensaver: Option<Duration>,
+    pub brightness: f32,
+    pub dim_after: Option<Duration>,
+    pub dim_brightness: f32,
+    pub off_after: Option<Duration>,
+    pub backlight: Option<String>,
     pub screen_off_command: Option<String>,
     pub screen_on_command: Option<String>,
     pub diagnostics: bool,
@@ -36,6 +40,28 @@ fn seconds(key: &str) -> Result<Option<f32>, String> {
                 .map_err(|_| format!("{key}: expected seconds, got {v:?}"))
         })
         .transpose()
+}
+
+fn duration(key: &str) -> Result<Option<Duration>, String> {
+    Ok(seconds(key)?
+        .filter(|s| *s > 0.0)
+        .map(Duration::from_secs_f32))
+}
+
+fn level(key: &str, default: f32) -> Result<f32, String> {
+    let Some(v) = var(key) else {
+        return Ok(default);
+    };
+    let n = v
+        .trim_end_matches('%')
+        .parse::<f32>()
+        .map_err(|_| format!("{key}: expected 0-1 or a percentage, got {v:?}"))?;
+    let n = if v.ends_with('%') || n > 1.0 {
+        n / 100.0
+    } else {
+        n
+    };
+    Ok(n.clamp(0.0, 1.0))
 }
 
 impl Config {
@@ -70,9 +96,11 @@ impl Config {
             }),
             interval: Duration::from_secs_f32(seconds("INTERVAL")?.unwrap_or(0.5).max(0.05)),
             layout,
-            screensaver: seconds("SCREENSAVER")?
-                .filter(|s| *s > 0.0)
-                .map(Duration::from_secs_f32),
+            brightness: level("BRIGHTNESS", 1.0)?,
+            dim_after: duration("DIM_AFTER")?,
+            dim_brightness: level("DIM_BRIGHTNESS", 0.25)?,
+            off_after: duration("OFF_AFTER")?,
+            backlight: var("BACKLIGHT"),
             screen_off_command: var("SCREEN_OFF_COMMAND"),
             screen_on_command: var("SCREEN_ON_COMMAND"),
             diagnostics: !matches!(

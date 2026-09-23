@@ -1,5 +1,4 @@
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,6 +10,7 @@ use eframe::egui::{
 };
 
 use crate::config::{Config, Layout};
+use crate::power::Power;
 use crate::stats::{self, FrigateStats, HostStats};
 use crate::workers::{self, Link, SharedRef};
 
@@ -44,17 +44,8 @@ struct EventPanel {
     aspect: f32,
 }
 
-struct Screensaver {
-    idle: Duration,
-    off_command: Option<String>,
-    on_command: Option<String>,
-    last_activity: Instant,
-    asleep: bool,
-}
-
 pub struct App {
     shared: SharedRef,
-    awake: Arc<AtomicBool>,
     event_height: Arc<AtomicU32>,
     layout: Layout,
     clock_format: String,
@@ -63,22 +54,10 @@ pub struct App {
     event: Option<EventPanel>,
     manual_focus: Option<usize>,
     auto_dismissed: bool,
-    screensaver: Option<Screensaver>,
-    woke_at: Instant,
-    ignore_clicks_until: Instant,
+    power: Power,
     diagnostics: bool,
     host: Option<HostStats>,
     frigate_stats: Option<FrigateStats>,
-}
-
-fn run_command(command: &Option<String>) {
-    if let Some(cmd) = command.clone() {
-        thread::spawn(move || {
-            if let Err(e) = Command::new("sh").arg("-c").arg(&cmd).status() {
-                eprintln!("{cmd}: {e}");
-            }
-        });
-    }
 }
 
 fn local_time(epoch: f64) -> Option<DateTime<Local>> {
@@ -94,14 +73,7 @@ impl App {
             let s = shared.lock().unwrap();
             (s.awake.clone(), s.event_height.clone())
         };
-        let now = Instant::now();
-        let screensaver = cfg.screensaver.map(|idle| Screensaver {
-            idle,
-            off_command: cfg.screen_off_command.clone(),
-            on_command: cfg.screen_on_command.clone(),
-            last_activity: now,
-            asleep: false,
-        });
+        let power = Power::new(&cfg, awake);
         let layout = cfg.layout;
         let diagnostics = cfg.diagnostics;
         let clock_format = cfg.clock_format.clone();
@@ -110,7 +82,6 @@ impl App {
         thread::spawn(move || workers::start(cfg, s, ctx));
         Self {
             shared,
-            awake,
             event_height,
             layout,
             clock_format,
@@ -119,9 +90,7 @@ impl App {
             event: None,
             manual_focus: None,
             auto_dismissed: false,
-            screensaver,
-            woke_at: now,
-            ignore_clicks_until: now,
+            power,
             diagnostics,
             host: None,
             frigate_stats: None,
@@ -169,7 +138,9 @@ impl App {
                 tile.aspect = img.size[0] as f32 / img.size[1] as f32;
                 upload(ctx, &mut tile.texture, &tile.name, img);
             }
-            let fresh_since = cam.updated.map_or(self.woke_at, |u| u.max(self.woke_at));
+            let fresh_since = cam
+                .updated
+                .map_or(self.power.woke_at, |u| u.max(self.power.woke_at));
             let latest = cam.alerts.values().max_by_key(|a| a.seen);
             status.push(TileStatus {
                 stale: now.duration_since(fresh_since) > STALE_AFTER,
@@ -195,33 +166,6 @@ impl App {
         self.host = s.host.clone();
         self.frigate_stats = s.frigate_stats.clone();
         (status, s.link, s.startup_error.clone(), ready)
-    }
-
-    fn update_screensaver(&mut self, ctx: &egui::Context, status: &[TileStatus]) -> bool {
-        let Some(saver) = self.screensaver.as_mut() else {
-            return false;
-        };
-        let now = Instant::now();
-        let touched = ctx.input(|i| i.pointer.any_pressed());
-        let activity = status.iter().any(|s| s.active || s.alert_seen.is_some());
-        if activity || touched {
-            saver.last_activity = now;
-        }
-        if saver.asleep && (activity || touched) {
-            saver.asleep = false;
-            self.awake.store(true, Ordering::Relaxed);
-            self.woke_at = now;
-            if touched {
-                self.ignore_clicks_until = now + Duration::from_millis(800);
-            }
-            run_command(&saver.on_command);
-        } else if !saver.asleep && now.duration_since(saver.last_activity) > saver.idle {
-            saver.asleep = true;
-            self.awake.store(false, Ordering::Relaxed);
-            self.manual_focus = None;
-            run_command(&saver.off_command);
-        }
-        saver.asleep
     }
 
     fn draw_info(&self, painter: &Painter, info: Rect, label_size: f32, ppp: f32) {
@@ -407,7 +351,9 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_secs(1));
 
         let (status, link, startup_error, ready) = self.sync(ctx);
-        let asleep = self.update_screensaver(ctx, &status);
+        let activity = status.iter().any(|s| s.active || s.alert_seen.is_some());
+        let (level, asleep) = self.power.update(ctx, activity);
+        let screen = root.max_rect();
 
         let alerting = status
             .iter()
@@ -421,7 +367,7 @@ impl eframe::App for App {
         let focus = self
             .manual_focus
             .or(if self.auto_dismissed { None } else { alerting });
-        let clicks_allowed = Instant::now() >= self.ignore_clicks_until;
+        let clicks_allowed = self.power.clicks_allowed();
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::BLACK))
@@ -520,6 +466,7 @@ impl eframe::App for App {
                     banner(&painter, screen, "Frigate disconnected", label_size);
                 }
             });
+        self.power.paint(ctx, screen, level);
     }
 }
 

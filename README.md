@@ -16,8 +16,8 @@ Frigate URL and a login. No MQTT broker is involved.
 - Tiles are fetched at the size they are drawn, and the grid picks the column count that makes the
   cameras largest, so it works the same on a 7" 800x480 panel and on a 4K monitor.
 - Tap a camera to show it full screen, tap again to go back.
-- An optional screensaver blanks the screen, and can turn the display off, until something is
-  detected.
+- The screen can dim when nothing is happening, turn off after a longer time, and come straight back
+  when something is detected.
 - The display's own CPU, temperature, load and memory, and Frigate's CPU, GPU, detector speed and
   recording disk use, sit at the bottom of the clock panel. The display line turns red if a Raspberry
   Pi reports undervoltage.
@@ -49,9 +49,13 @@ All settings are environment variables.
 | `CAMERAS` | from Frigate | Comma separated list, in display order |
 | `LAYOUT` | `grid` | `grid`, or `feature` for one large camera with the rest in a column |
 | `INTERVAL` | `0.5` | Seconds between snapshot fetches per camera |
-| `SCREENSAVER` | off | Seconds without activity before the screen blanks |
-| `SCREEN_OFF_COMMAND` | none | Shell command run when the screensaver starts |
-| `SCREEN_ON_COMMAND` | none | Shell command run when it ends |
+| `BRIGHTNESS` | `1` | Normal brightness, `0` to `1` or a percentage |
+| `DIM_AFTER` | off | Seconds without activity before dimming |
+| `DIM_BRIGHTNESS` | `0.25` | Brightness while dimmed |
+| `OFF_AFTER` | off | Seconds without activity before the screen turns off |
+| `SCREEN_OFF_COMMAND` | none | Shell command run when the screen turns off |
+| `SCREEN_ON_COMMAND` | none | Shell command run when it turns back on |
+| `BACKLIGHT` | first found | Device in `/sys/class/backlight`, or `none` to dim in software |
 | `DIAGNOSTICS` | `1` | `0` hides the display and Frigate stats |
 | `CLOCK_FORMAT` | `%H:%M` | [chrono format](https://docs.rs/chrono/latest/chrono/format/strftime/index.html) |
 | `DATE_FORMAT` | `%a %d %b` | |
@@ -59,14 +63,21 @@ All settings are environment variables.
 Without `CAMERAS`, camwall shows the cameras that are enabled and visible on Frigate's dashboard,
 sorted by their `ui.order`.
 
-## Screensaver
+## Brightness and screen off
 
-With `SCREENSAVER=300`, the screen goes black after five minutes with no active objects, alerts or
-touches, and snapshot fetching pauses. It comes back as soon as Frigate tracks an object on any shown
-camera, or when the screen is touched.
+Activity means an active tracked object or an alert on any shown camera, or a touch. With
+`DIM_AFTER=60`, the screen fades to `DIM_BRIGHTNESS` after a minute without activity and brightens again
+as soon as there is some. With `OFF_AFTER=1800`, it goes black after half an hour and snapshot fetching
+pauses until the next activity. A touch that wakes the screen does not also open a camera.
 
-A black screen still has its backlight on. To switch the display off, set the two commands. Under cage,
-`wlr-randr` can disable the output:
+If the display has a backlight in `/sys/class/backlight`, as the official Raspberry Pi touch displays do,
+camwall sets it directly, and at `OFF_AFTER` the backlight goes to zero. The camwall user needs write
+access to it, which `dist/90-backlight.rules` grants to the `video` group. HDMI displays usually have no
+such control, so camwall dims by drawing black over the picture. That makes the picture darker but leaves
+the backlight on.
+
+To turn an HDMI display off at `OFF_AFTER`, set the two commands. Under cage, `wlr-randr` can disable
+the output:
 
 ```
 SCREEN_OFF_COMMAND=wlr-randr --output HDMI-A-1 --off
@@ -74,8 +85,7 @@ SCREEN_ON_COMMAND=wlr-randr --output HDMI-A-1 --on
 ```
 
 Run `wlr-randr` as the camwall user to find the output name. A TV can be put in standby over HDMI CEC
-with `cec-ctl` instead. Some displays cannot report touches while their output is off, so with
-these commands only a detection may wake the screen.
+with `cec-ctl` instead.
 
 ## Build
 
@@ -105,6 +115,7 @@ sudo useradd --system --shell /usr/sbin/nologin --groups video,render,input camw
 sudo install -m755 camwall /usr/local/bin/
 sudo install -m640 -g camwall dist/camwall.env.example /etc/camwall.env
 sudo install -m644 dist/camwall.service /etc/systemd/system/
+sudo install -m644 dist/90-backlight.rules /etc/udev/rules.d/
 sudo systemctl disable getty@tty1
 sudo systemctl enable --now camwall
 ```

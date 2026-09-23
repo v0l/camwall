@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod frigate;
+mod power;
 mod stats;
 mod workers;
 
