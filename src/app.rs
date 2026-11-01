@@ -550,7 +550,8 @@ impl eframe::App for App {
                     };
                     label(&painter, area.min + vec2(8.0, 8.0), text, label_size, color);
 
-                    let response = ui.interact(*rect, ui.id().with(("tile", *i)), Sense::click());
+                    let response =
+                        ui.interact(*rect, ui.scope_id().with(("tile", *i)), Sense::click());
                     if response.clicked() && clicks_allowed {
                         if self.manual_focus.is_some() {
                             self.manual_focus = None;

@@ -165,7 +165,7 @@ impl Power {
             return;
         }
         let alpha = ((1.0 - level.clamp(0.0, 1.0)) * 255.0).round() as u8;
-        ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("dim")))
+        ctx.layer_painter(LayerId::new(Order::Foreground, Id::unique("dim")))
             .rect_filled(screen, 0.0, Color32::from_black_alpha(alpha));
     }
 }
