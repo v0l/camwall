@@ -21,9 +21,12 @@ fn main() -> eframe::Result {
             .with_app_id("camwall")
             .with_fullscreen(true)
             .with_decorations(false),
-        renderer: eframe::Renderer::Glow,
-        glow_options: eframe::egui_glow::GlowConfiguration {
-            vsync: false,
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            surface: eframe::egui_wgpu::SurfaceConfig {
+                present_mode: eframe::egui_wgpu::wgpu::PresentMode::AutoNoVsync,
+                ..eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT
+            },
             ..Default::default()
         },
         ..Default::default()

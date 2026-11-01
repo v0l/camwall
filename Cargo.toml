@@ -9,7 +9,7 @@ keywords = ["frigate", "nvr", "egui", "raspberry-pi", "kiosk"]
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "wayland"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11", "clipboard", "links"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1.0.151"
